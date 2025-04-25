@@ -1,0 +1,12 @@
+# Ignore wrangler configuration file
+wrangler.toml
+
+# Ignore Cloudflare Worker build and temporary files
+/.wrangler
+/node_modules
+/dist
+
+# Ignore hidden files and directories (dotfiles)
+.*
+!.gitignore
+.DS_Store
