@@ -174,7 +174,7 @@ export default {
     if (deviceData) {
       const parsed = JSON.parse(deviceData);
       const fetchedAt = new Date(parsed.fetchedAt);
-      if ((Date.now() - fetchedAt.getTime()) < 86400000) shouldFetchDevices = false;
+      if ((Date.now() - fetchedAt.getTime()) < env.DEVICE_LIST_CACHE) shouldFetchDevices = false;
     }
 
     if (shouldFetchDevices) {
@@ -221,7 +221,7 @@ async function getFirmwareData(device, env) {
   if (firmwareDataJson) {
     const parsed = JSON.parse(firmwareDataJson);
     const fetchedAt = new Date(parsed.fetchedAt);
-    if ((Date.now() - fetchedAt.getTime()) < 1800000) {
+    if ((Date.now() - fetchedAt.getTime()) < env.KV_CACHE_INVALID) {
       firmwareData = parsed.data;
       shouldFetch = false;
     }
@@ -233,7 +233,7 @@ async function getFirmwareData(device, env) {
       fetchedAt: new Date().toISOString(),
       data: firmwareData
     });
-    await env.RELEASES.put(device, firmwareDataJson, { expirationTtl: 1800 });
+    await env.RELEASES.put(device, firmwareDataJson, { expirationTtl: env.KV_CACHE_AUTOREMOVE });
   }
 
   return firmwareData;
