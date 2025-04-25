@@ -1,7 +1,7 @@
 <p align="center">
 	<a href="https://earlynotify.com">
 		<picture>
-			<img src="https://files.earlynotify.com/logo-white-bg.png" alt="EarlyNotify" width="550">
+			<img src="https://files.earlynotify.com/logo-white-bg.png" alt="EarlyNotify" width="350">
 		</picture>
 	</a>
 	<br>
@@ -11,7 +11,7 @@
 
 EarlyNotify is designed to keep you up-to-date with the latest Apple updates, notifying you within just 15 minutes of new updates hitting Apple servers.
 
-EarlyNotify ensures you never miss a critical update again. Sign up today and take control of your Apple devices. 
+Never miss a critical update again.
 
 Deploy yourself:
 1. Create a Cloudflare D1 database and configure with migrations/init.sql

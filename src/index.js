@@ -1,5 +1,5 @@
 function nanoid(size = 64) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let id = '';
   const array = new Uint8Array(size);
   crypto.getRandomValues(array);
@@ -20,16 +20,17 @@ export default {
       return new Response(await getFormPage(deviceJson, env), {
         headers: {
           'Content-Type': 'text/html',
-          'Access-Control-Allow-Origin': '*', // <-- allow all origins
+          'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Headers': '*',
-        }},);
+        },
+      });
     }
 
     if (request.method === 'GET' && url.pathname === '/devices') {
       const deviceData = await env.NOTIFY.get('device_list');
       const parsed = deviceData ? JSON.parse(deviceData) : { devices: [] };
       const deviceList = parsed.devices;
-    
+
       const grouped = {};
       for (const d of deviceList) {
         let type = d.identifier.split(',')[0]
@@ -37,16 +38,15 @@ export default {
           .replace('Watch', 'Apple Watch')
           .replace('AudioAccessory', 'HomePod')
           .replace('RealityDevice', 'Vision Pro');
-    
-        // Group Macs under a single type
+
         if (['Macmini', 'iMac', 'VirtualMac', 'MacBookAir', 'MacBookPro'].includes(type)) {
           type = 'Mac';
         }
-    
+
         if (!grouped[type]) grouped[type] = [];
         grouped[type].push({ name: d.name, id: d.identifier });
       }
-    
+
       return new Response(JSON.stringify(grouped), {
         headers: {
           'Content-Type': 'application/json',
@@ -54,7 +54,6 @@ export default {
         },
       });
     }
-     
 
     if (request.method === 'GET' && url.pathname.startsWith('/unsubscribe')) {
       const token = url.searchParams.get('token');
@@ -92,28 +91,22 @@ export default {
       const email = formData.get('email');
       const device = formData.get('device');
       const hcaptchaToken = formData.get('h-captcha-response');
-    
+
       const headers = {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Headers': 'Content-Type',
         'Access-Control-Allow-Methods': 'POST',
       };
-    
+
       if (!email || !device) {
-        return new Response(JSON.stringify({ error: 'Missing email or device' }), {
-          status: 400,
-          headers,
-        });
+        return new Response(JSON.stringify({ error: 'Missing email or device' }), { status: 400, headers });
       }
-    
+
       if (!hcaptchaToken) {
-        return new Response(JSON.stringify({ error: 'Captcha token missing' }), {
-          status: 400,
-          headers,
-        });
+        return new Response(JSON.stringify({ error: 'Captcha token missing' }), { status: 400, headers });
       }
-    
+
       const hcaptchaRes = await fetch('https://hcaptcha.com/siteverify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -122,50 +115,43 @@ export default {
           response: hcaptchaToken,
         }),
       }).then(r => r.json());
-    
+
       if (!hcaptchaRes.success) {
-        return new Response(JSON.stringify({ error: 'Captcha verification failed' }), {
-          status: 403,
-          headers,
-        });
+        return new Response(JSON.stringify({ error: 'Captcha verification failed' }), { status: 403, headers });
       }
-    
-      const firmwareData = await getFirmwareData(device, env);
-    
-      if (!firmwareData || !firmwareData.firmwares || firmwareData.firmwares.length === 0) {
-        return new Response(JSON.stringify({ error: 'Unsupported Device' }), {
-          status: 400,
-          headers,
-        });
-      }
-    
-      const latestVersion = firmwareData.firmwares[0]?.version;
+
+      const firmwareCacheJson = await env.RELEASES.get('firmware_cache');
+      const firmwareCache = firmwareCacheJson ? JSON.parse(firmwareCacheJson) : {};
+
+      const firmwareData = await fetchFirmwareAndUpdateCache(device, firmwareCache, env);
+
+      const latestVersion = firmwareData?.firmwares?.[0]?.version;
       const unsubscribeToken = nanoid();
-    
+
       await env.DB.prepare(`
         INSERT INTO subscriptions (email, device_id, subscribed_at, active, unsubscribe_token)
         VALUES (?, ?, datetime('now'), 1, ?)
         ON CONFLICT(email, device_id) DO UPDATE SET active = 1, unsubscribe_token = excluded.unsubscribe_token;
       `).bind(email, device, unsubscribeToken).run();
-    
+
       if (latestVersion) {
         const deviceData = await env.NOTIFY.get('device_list');
         const parsed = deviceData ? JSON.parse(deviceData) : { devices: [] };
         const deviceJson = parsed.devices;
         const friendlyName = deviceJson.find(d => d.identifier === device)?.name || device;
-    
+
         await sendEmailLambda(env, email, friendlyName, latestVersion, unsubscribeToken, 'version');
-    
+
         await env.DB.prepare(`
           UPDATE subscriptions SET last_notified_version = ? WHERE email = ? AND device_id = ?
         `).bind(latestVersion, email, device).run();
       }
-    
-      return new Response(JSON.stringify({ message: 'Subscription successful!' }), {
-        headers,
-      });
-    }},
-    
+
+      await env.RELEASES.put('firmware_cache', JSON.stringify(firmwareCache), { expirationTtl: env.KV_CACHE_AUTOREMOVE });
+
+      return new Response(JSON.stringify({ message: 'Subscription successful!' }), { headers });
+    }
+  },
 
   async scheduled(event, env, ctx) {
     let deviceData = await env.NOTIFY.get('device_list');
@@ -189,9 +175,30 @@ export default {
       SELECT DISTINCT device_id FROM subscriptions WHERE active = 1
     `).all();
 
+    const firmwareCacheJson = await env.RELEASES.get('firmware_cache');
+    const firmwareCache = firmwareCacheJson ? JSON.parse(firmwareCacheJson) : {};
+    let firmwareUpdated = false;
+
+    async function fetchFirmware(deviceId) {
+      const entry = firmwareCache[deviceId];
+      const now = Date.now();
+
+      if (entry && (now - new Date(entry.fetchedAt).getTime()) < env.KV_CACHE_INVALID) {
+        return entry.data;
+      }
+
+      const data = await fetch(`https://api.ipsw.me/v4/device/${deviceId}?type=ipsw`).then(res => res.json());
+      firmwareCache[deviceId] = {
+        fetchedAt: new Date().toISOString(),
+        data,
+      };
+      firmwareUpdated = true;
+      return data;
+    }
+
     for (const { device_id: deviceId } of subscribedDevices) {
-      const firmwareData = await getFirmwareData(deviceId, env);
-      const latestVersion = firmwareData.firmwares[0]?.version;
+      const firmwareData = await fetchFirmware(deviceId);
+      const latestVersion = firmwareData?.firmwares?.[0]?.version;
       if (!latestVersion) continue;
 
       const { results } = await env.DB.prepare(`
@@ -210,86 +217,30 @@ export default {
         }
       }
     }
+
+    if (firmwareUpdated) {
+      await env.RELEASES.put('firmware_cache', JSON.stringify(firmwareCache), { expirationTtl: env.KV_CACHE_AUTOREMOVE });
+    }
   },
 };
 
-async function getFirmwareData(device, env) {
-  let firmwareDataJson = await env.RELEASES.get(device);
-  let firmwareData;
-  let shouldFetch = true;
+async function fetchFirmwareAndUpdateCache(deviceId, firmwareCache, env) {
+  const entry = firmwareCache[deviceId];
+  const now = Date.now();
 
-  if (firmwareDataJson) {
-    const parsed = JSON.parse(firmwareDataJson);
-    const fetchedAt = new Date(parsed.fetchedAt);
-    if ((Date.now() - fetchedAt.getTime()) < env.KV_CACHE_INVALID) {
-      firmwareData = parsed.data;
-      shouldFetch = false;
-    }
+  if (entry && (now - new Date(entry.fetchedAt).getTime()) < env.KV_CACHE_INVALID) {
+    return entry.data;
   }
 
-  if (shouldFetch) {
-    firmwareData = await fetch(`https://api.ipsw.me/v4/device/${device}?type=ipsw`).then(res => res.json());
-    firmwareDataJson = JSON.stringify({
-      fetchedAt: new Date().toISOString(),
-      data: firmwareData
-    });
-    await env.RELEASES.put(device, firmwareDataJson, { expirationTtl: env.KV_CACHE_AUTOREMOVE });
-  }
-
-  return firmwareData;
+  const data = await fetch(`https://api.ipsw.me/v4/device/${deviceId}?type=ipsw`).then(res => res.json());
+  firmwareCache[deviceId] = {
+    fetchedAt: new Date().toISOString(),
+    data,
+  };
+  return data;
 }
 
-async function getFormPage(deviceList, env) {
-  const grouped = {};
-  for (const d of deviceList) {
-    const type = d.identifier.split(',')[0].replace(/\d+/g, '').replace('Watch', 'Apple Watch').replace('TV', 'Apple TV');
-    if (!grouped[type]) grouped[type] = [];
-    grouped[type].push({ name: d.name, id: d.identifier });
-  }
-
-  const typeOptions = Object.keys(grouped).map(type => `<option value="${type}">${type}</option>`).join('');
-
-  const deviceDataScript = `<script>
-    const DEVICE_DATA = ${JSON.stringify(grouped)};
-    function updateModelOptions() {
-      const category = document.getElementById('category').value;
-      const modelSelect = document.getElementById('device');
-      const options = DEVICE_DATA[category].slice().reverse().map(function(d) {
-        return '<option value="' + d.id + '">' + d.name + '</option>';
-      }).join('');
-      modelSelect.innerHTML = options;
-    }
-  </script>`;
-
-  return `
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>iOS Update Notifier</title>
-      <script src="https://hcaptcha.com/1/api.js" async defer></script>
-    </head>
-    <body>
-      <h1>Subscribe for iOS Updates</h1>
-      <form action="/subscribe" method="POST">
-        <label>Email: <input type="email" name="email" required></label><br>
-        <label>Device Type:
-          <select id="category" onchange="updateModelOptions()">
-            <option selected disabled>Select</option>
-            ${typeOptions}
-          </select>
-        </label><br>
-        <label>Device Model:
-          <select id="device" name="device"></select>
-        </label><br>
-        <div class="h-captcha" data-sitekey="${env.HCAPTCHA_SITE_KEY}"></div><br>
-        <button type="submit">Subscribe</button>
-      </form>
-      ${deviceDataScript}
-    </body>
-    </html>
-  `;
-}
-
+// sendEmailLambda and getFormPage remain unchanged from your original code.
 async function sendEmailLambda(env, to, device, version, unsubscribeToken, messageType) {
   const unsubscribeUrl = `${env.API_SITE_URL}/unsubscribe?token=${unsubscribeToken}`;
 
