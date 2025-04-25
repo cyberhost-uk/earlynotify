@@ -1,4 +1,13 @@
-# EarlyNotify.com
+<p align="center">
+	<a href="https://earlynotify.com">
+		<picture>
+			<img src="https://files.earlynotify.com/logo.png" alt="EarlyNotify" width="550">
+		</picture>
+	</a>
+	<br>
+</p>
+<h3 align="center">Stay Ahead with EarlyNotify</h3>
+<hr>
 
 EarlyNotify is designed to keep you up-to-date with the latest Apple updates, notifying you within just 15 minutes of new updates hitting Apple servers.
 
