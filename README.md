@@ -1,7 +1,7 @@
 <p align="center">
 	<a href="https://earlynotify.com">
 		<picture>
-			<img src="https://files.earlynotify.com/logo.jpg" alt="EarlyNotify" width="550">
+			<img src="https://files.earlynotify.com/logo-white-bg.png" alt="EarlyNotify" width="550">
 		</picture>
 	</a>
 	<br>
