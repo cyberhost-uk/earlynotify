@@ -147,7 +147,7 @@ export default {
         `).bind(latestVersion, email, device).run();
       }
 
-      await env.RELEASES.put('firmware_cache', JSON.stringify(firmwareCache), { expirationTtl: env.KV_CACHE_AUTOREMOVE });
+      await env.RELEASES.put('firmware_cache', JSON.stringify(firmwareCache), { expirationTtl: env.KV_CACHE_AUTOREMOVE * 60 });
 
       return new Response(JSON.stringify({ message: 'Subscription successful!' }), { headers });
     }
@@ -183,7 +183,7 @@ export default {
       const entry = firmwareCache[deviceId];
       const now = Date.now();
 
-      if (entry && (now - new Date(entry.fetchedAt).getTime()) < env.KV_CACHE_INVALID) {
+      if (entry && (now - new Date(entry.fetchedAt).getTime()) < env.KV_CACHE_INVALID * 60 * 1000) {
         return entry.data;
       }
 
@@ -219,7 +219,7 @@ export default {
     }
 
     if (firmwareUpdated) {
-      await env.RELEASES.put('firmware_cache', JSON.stringify(firmwareCache), { expirationTtl: env.KV_CACHE_AUTOREMOVE });
+      await env.RELEASES.put('firmware_cache', JSON.stringify(firmwareCache), { expirationTtl: env.KV_CACHE_AUTOREMOVE * 60 });
     }
   },
 };
@@ -228,7 +228,7 @@ async function fetchFirmwareAndUpdateCache(deviceId, firmwareCache, env) {
   const entry = firmwareCache[deviceId];
   const now = Date.now();
 
-  if (entry && (now - new Date(entry.fetchedAt).getTime()) < env.KV_CACHE_INVALID) {
+  if (entry && (now - new Date(entry.fetchedAt).getTime()) < env.KV_CACHE_INVALID * 60 * 1000) {
     return entry.data;
   }
 

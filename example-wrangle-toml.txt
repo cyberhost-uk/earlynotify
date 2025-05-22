@@ -29,7 +29,38 @@ HCAPTCHA_SECRET=
 API_SITE_URL=
 #Cache device list for 1 day
 DEVICE_LIST_CACHE=86400000
-#Cache latest firmware for device for 15 mins
-KV_CACHE_INVALID=900000
-#Cloudflare KV TTL - Remove all entries over 6 hours old (keep it tidy)
-KV_CACHE_AUTOREMOVE=21600
+name = "EarlyNotify"
+compatibility_date = "2024-04-19"
+main = "src/index.js"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "EarlyNotify_db"
+database_id = ""
+
+# General Storage
+[[kv_namespaces]]
+binding = "NOTIFY"
+id = ""
+
+# Caching of ipsw.me responses per device
+[[kv_namespaces]]
+binding = "RELEASES"
+id = ""
+
+[env.staging.observability]
+enabled = true
+
+[vars]
+LAMBDA_API_KEY=
+LAMBDA_URL=
+HCAPTCHA_SITE_KEY=
+HCAPTCHA_SECRET=
+API_SITE_URL=
+#Cache device list for 1 day
+DEVICE_LIST_CACHE=86400000
+#Cache latest firmware for device for 14 mins
+KV_CACHE_INVALID=14
+#Cloudflare KV TTL (Minutes) - Remove all entries over 6 hours old (keep it tidy)
+KV_CACHE_AUTOREMOVE=360
