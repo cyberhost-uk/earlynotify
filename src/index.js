@@ -160,7 +160,7 @@ export default {
     if (deviceData) {
       const parsed = JSON.parse(deviceData);
       const fetchedAt = new Date(parsed.fetchedAt);
-      if ((Date.now() - fetchedAt.getTime()) < env.DEVICE_LIST_CACHE) shouldFetchDevices = false;
+      if ((Date.now() - fetchedAt.getTime()) < env.DEVICE_LIST_CACHE * 60 * 1000) shouldFetchDevices = false;
     }
 
     if (shouldFetchDevices) {
