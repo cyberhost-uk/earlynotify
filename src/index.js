@@ -249,7 +249,7 @@ async function sendEmailLambda(env, to, device, version, unsubscribeToken, messa
 
   switch (messageType) {
     case 'version':
-      subject = `Software Version ${version} now avalible ${device}`;
+      subject = `Software Version ${version} now available for ${device}`;
       templateKey = 'email_version';
       break;
     case 'unsubscribe':
