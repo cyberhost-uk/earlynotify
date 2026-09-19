@@ -8,59 +8,38 @@ binding = "DB"
 database_name = "EarlyNotify_db"
 database_id = ""
 
-# General Storage
+# General Storage: email templates + device catalog.
+# ipsw.me responses are cached in D1 (table firmware_cache), not KV — the free
+# KV plan allows 1,000 writes/day and that cache is written every minute.
 [[kv_namespaces]]
 binding = "NOTIFY"
-id = ""
-
-# Caching of ipsw.me responses per device
-[[kv_namespaces]]
-binding = "RELEASES"
 id = ""
 
 [env.staging.observability]
 enabled = true
 
-[vars]
-LAMBDA_API_KEY=
-LAMBDA_URL=
-HCAPTCHA_SITE_KEY=
-HCAPTCHA_SECRET=
-API_SITE_URL=
-#Cache device list for 1 day
-DEVICE_LIST_CACHE=86400000
-name = "EarlyNotify"
-compatibility_date = "2024-04-19"
-main = "src/index.js"
-workers_dev = true
-
-[[d1_databases]]
-binding = "DB"
-database_name = "EarlyNotify_db"
-database_id = ""
-
-# General Storage
-[[kv_namespaces]]
-binding = "NOTIFY"
-id = ""
-
-# Caching of ipsw.me responses per device
-[[kv_namespaces]]
-binding = "RELEASES"
-id = ""
-
-[env.staging.observability]
-enabled = true
+[triggers]
+# 1 min: poll ipsw.me and flag devices whose version moved
+# 2 min: dispatch pending notifications
+crons = ["* * * * *", "*/2 * * * *"]
 
 [vars]
-LAMBDA_API_KEY=
 LAMBDA_URL=
 HCAPTCHA_SITE_KEY=
-HCAPTCHA_SECRET=
 API_SITE_URL=
+SITE_URL=
 #Cache device list for 1 day
 DEVICE_LIST_CACHE=1440
-#Cache latest firmware for device for 14 mins
+#Re-poll ipsw.me for a given device after 14 mins. This is the dominant term in
+#how quickly a release is noticed, so lowering it trades ipsw.me load for latency.
 KV_CACHE_INVALID=14
-#Cloudflare KV TTL (Minutes) - Remove all entries over 6 hours old (keep it tidy)
-KV_CACHE_AUTOREMOVE=360
+
+# Secrets are NOT set here — anything under [vars] is committed in plaintext and
+# readable in the Cloudflare dashboard. Set them with:
+#
+#   wrangler secret put LAMBDA_API_KEY
+#   wrangler secret put HCAPTCHA_SECRET
+#   wrangler secret put INTERNAL_SECRET   # openssl rand -hex 32
+#
+# INTERNAL_SECRET authenticates /internal/send and /internal/bounce. Both can
+# send email or deactivate subscribers, so treat it like a production credential.
