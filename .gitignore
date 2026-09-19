@@ -1,12 +1,21 @@
-# Ignore wrangler configuration file
+# Real config, including live secrets. Copy wrangler.toml.example to get started.
 wrangler.toml
 
-# Ignore Cloudflare Worker build and temporary files
+# Cloudflare Worker build and temporary files
 /.wrangler
 /node_modules
 /dist
 
-# Ignore hidden files and directories (dotfiles)
-.*
-!.gitignore
+# The marketing site lives in its own repository
+/earlynotify-site
+
+# OS and editor cruft
 .DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets and local env
+.env
+.env.*
+.dev.vars
