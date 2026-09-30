@@ -58,6 +58,8 @@ of most of the non-obvious decisions in `src/index.js`. See
 
 1. Apply `migrations/002_scale.sql` and `migrations/003_firmware_d1.sql`.
 2. Set `INTERNAL_SECRET` — dispatch refuses to run without it.
+   Also add the `SELF` service binding from `wrangler.toml.example` — dispatch
+   refuses to run without it.
 3. **Replace your cron triggers with exactly `* * * * *` and `*/2 * * * *`.** The two jobs
    have separate subrequest budgets and cannot share an invocation, so any other schedule
    is rejected and logged rather than guessed at.
@@ -67,15 +69,17 @@ of most of the non-obvious decisions in `src/index.js`. See
 ## Design notes
 
 **Sending fans out.** The 1-minute cron records which devices changed version. The
-2-minute cron picks those up and hands batches to `/internal/send`, each of which runs as
-its own Worker invocation. The free tier allows 50 subrequests per invocation, so fanning
+2-minute cron picks those up and hands batches to `/internal/send` through the `SELF`
+service binding, each of which runs as its own Worker invocation. (A plain `fetch()` to the
+Worker's own hostname does not work — same-zone Worker-to-Worker fetch fails.) The free tier allows 50 subrequests per invocation, so fanning
 out is what lifts the per-run email ceiling — a single invocation caps out around 45
 emails no matter what.
 
-**Sending is paced to 12 emails/sec**, deliberately under the SES default of 14/sec. A
-throttled send returns an error, gets retried, and becomes a duplicate email to a real
-person, so running just below the ceiling beats running at it. If you raise your SES
-quota, raise `CHILD_CONCURRENCY` in `src/index.js` to match.
+**Sending is paced to 6 emails/sec**, under the SES default of 14/sec. A throttled send
+returns an error, gets retried, and becomes a duplicate email to a real person, so running
+below the ceiling beats running at it. The pace is set by Cloudflare, not SES: batches
+called through a service binding share the top-level request's 6-connection limit, so
+raising `CHILD_CONCURRENCY` would not send any faster — the extra waves just queue.
 
 **The firmware cache lives in D1, not KV.** The free KV plan allows 1,000 writes/day and
 this cache is written roughly every minute, so a KV-backed version exceeds the quota on

@@ -25,16 +25,22 @@ const IPSW_USER_AGENT = 'EarlyNotify/1.0 (+https://earlynotify.com)';
 // emails/sec. Subrequest budgets, worst case:
 //
 //   child    1 KV read + 36 Lambda sends + 6 D1 batches      = 43
-//   parent   ~5 KV/D1 + 6 queries + 32 children + 2 writes   = 45
+//   parent   ~5 KV/D1 + 6 queries + 31 children + 2 writes   = 44
 //   refresh  ~6 KV/D1 + 30 ipsw fetches + 3 writes           = 39
 //
-// Throughput: 2 children in flight, each pacing 6 sends/sec, is 12/sec — held
-// deliberately under 14/sec so SES never throttles us (a throttled send looks
-// like a failure, gets retried next run, and turns into a duplicate email).
+// Throughput: one child in flight, pacing 6 sends/sec. Children are reached via
+// the SELF service binding, and service-bound invocations share the top-level
+// request's 6-connection cap — a second concurrent child would not double the
+// rate, its waves would just queue behind the first's. 6/sec is also well under
+// SES's 14/sec, so a send is never throttled (a throttled send looks like a
+// failure, gets retried next run, and turns into a duplicate email). At 6/sec
+// the 150 s deadline covers ~900 emails per run; the rest go on the next tick.
 // ---------------------------------------------------------------------------
 const EMAILS_PER_CHILD     = 36;       // 6 waves of 6
-const MAX_CHILDREN_PER_RUN = 32;
-const CHILD_CONCURRENCY    = 2;
+// 31, not 32: a request chain is capped at 32 Worker invocations and the
+// coordinator is one of them, so the 32nd child call would throw.
+const MAX_CHILDREN_PER_RUN = 31;
+const CHILD_CONCURRENCY    = 1;
 const SEND_WAVE_SIZE       = 6;        // == free-tier concurrent connection cap
 const SEND_WAVE_MIN_MS     = 1000;     // 6 sends/sec/child
 const DISPATCH_DEADLINE_MS = 150_000;
@@ -770,6 +776,10 @@ async function dispatchNotifications(env) {
     console.error('dispatch_state row missing — run migrations/002_scale.sql');
     return;
   }
+  if (!env.SELF) {
+    console.error('SELF service binding missing — add it to wrangler.toml (see wrangler.toml.example)');
+    return;
+  }
   if (!env.INTERNAL_SECRET) {
     console.error('INTERNAL_SECRET not set — cannot fan out; run `wrangler secret put INTERNAL_SECRET`');
     return;
@@ -882,7 +892,10 @@ async function runDispatch(env, devices, flagged, startedAt) {
     while (next < chunks.length && Date.now() - startedAt < DISPATCH_DEADLINE_MS) {
       const chunk = chunks[next++];
       try {
-        const res = await fetch(`${env.API_SITE_URL}/internal/send`, {
+        // Through the SELF service binding, never the public URL: a global
+        // fetch() to a Worker on its own zone fails, so every batch errored
+        // out and the run sent 0 emails.
+        const res = await env.SELF.fetch('https://internal/internal/send', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-internal-key': env.INTERNAL_SECRET },
           body: JSON.stringify({ batch: chunk }),
@@ -890,7 +903,8 @@ async function runDispatch(env, devices, flagged, startedAt) {
         if (!res.ok) throw new Error(`child returned ${res.status}: ${await res.text()}`);
         sent += (await res.json()).sent ?? 0;
       } catch (err) {
-        console.error('Send batch failed:', err);
+        // Log the message explicitly — the dashboard showed only the stack.
+        console.error(`Send batch failed: ${err?.message ?? err}`);
       }
     }
   };

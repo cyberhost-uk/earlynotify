@@ -15,6 +15,14 @@ database_id = ""
 binding = "NOTIFY"
 id = ""
 
+# Dispatch calls its own /internal/send through this binding. A plain fetch()
+# to the Worker's own hostname fails (same-zone Worker-to-Worker fetch is not
+# routed), so without it every notification batch errors. `service` must match
+# `name` above.
+[[services]]
+binding = "SELF"
+service = "EarlyNotify"
+
 [env.staging.observability]
 enabled = true
 
