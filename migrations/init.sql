@@ -1,15 +1,25 @@
+-- destination is an email address, webhook URL or, for Pushover,
+-- `userKey:appToken`, per channel. A pending (unconfirmed) row is active = 0 with confirm_token set.
 CREATE TABLE subscriptions (
-  email TEXT NOT NULL,
+  destination TEXT NOT NULL,
   device_id TEXT NOT NULL,
   subscribed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   active INTEGER DEFAULT 1,
   last_notified_version TEXT DEFAULT NULL,
   unsubscribe_token TEXT DEFAULT NULL,
   deactivated_reason TEXT DEFAULT NULL,
-  PRIMARY KEY (email, device_id)
+  channel TEXT NOT NULL DEFAULT 'email',
+  confirm_token TEXT DEFAULT NULL,
+  confirm_sent_at INTEGER DEFAULT NULL,   -- epoch ms
+  signing_secret TEXT DEFAULT NULL,       -- generic webhooks only
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,  -- non-email; see MAX_CONSECUTIVE_FAILURES
+  PRIMARY KEY (destination, device_id)
 );
 
 CREATE UNIQUE INDEX idx_unsubscribe_token ON subscriptions(unsubscribe_token);
+
+-- Not unique: one confirmation can cover several devices signed up together.
+CREATE INDEX idx_confirm_token ON subscriptions(confirm_token);
 
 -- Lets dispatch read one device's subscribers without scanning the table.
 CREATE INDEX idx_subscriptions_device_active ON subscriptions(device_id, active);

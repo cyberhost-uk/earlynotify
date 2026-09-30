@@ -59,6 +59,31 @@ const MAX_DEVICE_QUERIES   = 6;
 const REFRESH_CRON  = '* * * * *';
 const DISPATCH_CRON = '*/2 * * * *';
 
+// Double opt-in. One confirmation covers every device a destination signs up
+// for within the resend window, which also caps how often a stream of captcha
+// solves can make us message the same inbox or channel.
+const CONFIRM_TTL_MS      = 48 * 3_600_000;
+const CONFIRM_RESEND_MS   = 15 * 60_000;
+
+// A webhook that hangs holds up its whole wave, and so every other subscriber
+// in the batch, so each delivery gets a hard ceiling.
+const DELIVERY_TIMEOUT_MS = 5_000;
+
+// A non-email destination that fails this many sends in a row — timeouts, 5xx,
+// refused connections — is switched off like a deleted one. A failed send
+// clears its device's flag like any other attempt, so the retries after the
+// first come from the hourly sweep: 30 is roughly a day and a half of the
+// endpoint failing every time. Email is exempt, since its failures are our
+// Lambda or SES, not the subscriber; bounces cover bad addresses.
+const MAX_CONSECUTIVE_FAILURES = 30;
+
+// /internal/send is only ever reached through the SELF binding, whose requests
+// carry this made-up hostname. Public traffic arrives on the Worker's real
+// hostnames, so checking it shuts the endpoint to the internet even if
+// INTERNAL_SECRET leaks. /internal/bounce can't do the same — the Lambda calls
+// it over the public URL.
+const INTERNAL_HOST = 'internal';
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function timingSafeEqual(a, b) {
@@ -76,15 +101,24 @@ function authorizeInternal(request, env) {
 // Splitting the template once turns per-email rendering into string
 // concatenation. replaceAll over a ~15 KB template 40 times was the only part
 // of the child's work with a real claim on the 10 ms CPU budget.
+//
+// Values are escaped: device names and versions come from ipsw.me, which is not
+// ours to trust with markup in our emails.
 function compileTemplate(raw) {
-  const parts = raw.split(/\$\{(device|version|unsubscribeUrl)\}/);
+  const parts = raw.split(/\$\{(device|version|unsubscribeUrl|confirmUrl)\}/);
   return vars => {
     let out = '';
     for (let i = 0; i < parts.length; i++) {
-      out += (i % 2 === 0) ? parts[i] : (vars[parts[i]] ?? '');
+      out += (i % 2 === 0) ? parts[i] : escapeHtml(vars[parts[i]] ?? '');
     }
     return out;
   };
+}
+
+async function loadTemplate(env, key) {
+  const raw = await env.NOTIFY.get(key);
+  if (!raw) throw new Error(`Template ${key} not found`);
+  return compileTemplate(raw);
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +299,171 @@ async function refreshDeviceNames(env) {
   return devices;
 }
 
+// Slim { [deviceId]: friendlyName } map, rather than parsing device_list.
+async function deviceNames(env) {
+  return (await env.NOTIFY.get('device_names', { type: 'json' })) ?? {};
+}
+
+// ---------------------------------------------------------------------------
+// Channels
+//
+// A subscription's destination is an email address, a webhook URL, or for
+// Pushover `userKey:appToken`, depending on its channel. Chat webhook URLs and
+// Pushover app tokens are credentials, so they never reach the logs; see
+// describeDestination.
+// ---------------------------------------------------------------------------
+const CHANNELS = ['email', 'discord', 'slack', 'teams', 'pushover', 'webhook'];
+
+// Channels that skip double opt-in. Each destination is itself a credential:
+// whoever holds a chat webhook URL can already post to that channel, and
+// whoever holds a Pushover app token can already message any user key, so a
+// confirmation step would prove nothing they couldn't do without us. Email and
+// generic webhooks name a destination anyone can type, so they still confirm.
+const INSTANT_CHANNELS = new Set(['discord', 'slack', 'teams', 'pushover']);
+
+const CHAT_WEBHOOKS = {
+  discord: {
+    host: h => ['discord.com', 'discordapp.com', 'ptb.discord.com', 'canary.discord.com'].includes(h),
+    path: '/api/webhooks/',
+  },
+  slack: {
+    host: h => h === 'hooks.slack.com',
+    path: '/services/',
+  },
+  // Legacy Office 365 connectors, and the Power Automate "Workflows" webhooks
+  // Microsoft is replacing them with. Both accept an Adaptive Card message.
+  teams: {
+    host: h => ['.webhook.office.com', '.logic.azure.com', '.powerplatform.com'].some(s => h.endsWith(s)),
+    path: '/',
+  },
+};
+
+const DESTINATION_ERROR = {
+  email:    'Invalid email address',
+  discord:  'That is not a Discord webhook URL',
+  slack:    'That is not a Slack incoming webhook URL',
+  teams:    'That is not a Microsoft Teams webhook URL',
+  pushover: 'Invalid Pushover user key or application token',
+  webhook:  'Webhook URL must be a public https:// address',
+};
+
+// Returned whatever actually happened — see /subscribe.
+const ACCEPTED_MESSAGE = {
+  email:    'Check your inbox for a confirmation link.',
+  discord:  'Subscribed! The current version will be posted to your channel shortly.',
+  slack:    'Subscribed! The current version will be posted to your channel shortly.',
+  teams:    'Subscribed! The current version will be posted to your channel shortly.',
+  pushover: 'Subscribed! The current version will be sent to your devices shortly.',
+  webhook:  'We sent a subscription.confirm event with a confirmation link to your endpoint.',
+};
+
+// Returns the canonical destination, or null if it isn't valid for the channel.
+function normalizeDestination(channel, raw) {
+  if (typeof raw !== 'string') return null;
+  const value = raw.trim();
+
+  if (channel === 'email') {
+    const email = value.toLowerCase();
+    return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
+  }
+  if (channel === 'pushover') {
+    return /^[A-Za-z0-9]{30}:[A-Za-z0-9]{30}$/.test(value) ? value : null;
+  }
+
+  if (value.length > 2048) return null;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  // Default port only: a URL that names a port is a probe, not a webhook.
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) return null;
+  const host = url.hostname.toLowerCase();
+
+  if (channel === 'webhook') return isPublicHostname(host) ? url.toString() : null;
+
+  const rule = CHAT_WEBHOOKS[channel];
+  return rule && rule.host(host) && url.pathname.startsWith(rule.path) ? url.toString() : null;
+}
+
+// Keeps IP literals and internal-looking names out of generic webhooks. Paired
+// with redirect: 'manual' on delivery, so an accepted URL can't bounce the
+// request somewhere this check would have refused.
+function isPublicHostname(host) {
+  if (!host.includes('.') || host.startsWith('[') || /^[\d.]+$/.test(host)) return false;
+  return !/(^|\.)(localhost|local|internal|localdomain|home\.arpa)$/.test(host);
+}
+
+function describeDestination(sub) {
+  if (sub.channel === 'email') return sub.destination;
+  if (sub.channel === 'pushover') return `pushover:${sub.destination.slice(0, 4)}…`; // user key prefix only
+  try { return `${sub.channel}:${new URL(sub.destination).hostname}`; } catch { return sub.channel; }
+}
+
+// ---------------------------------------------------------------------------
+// Messages — channel-neutral; deliver() renders them per channel.
+// ---------------------------------------------------------------------------
+const unsubscribeLink = (env, token) => `${env.API_SITE_URL}/unsubscribe?token=${token}`;
+
+function releaseMessage(env, n) {
+  return {
+    event:          'firmware.released',
+    deviceId:       n.deviceId,
+    device:         n.friendlyName,
+    version:        n.version,
+    title:          `Software Version ${n.version} now available for ${n.friendlyName}`,
+    text:           `Software version ${n.version} is available for your ${n.friendlyName}.`,
+    unsubscribeUrl: unsubscribeLink(env, n.unsubscribeToken),
+  };
+}
+
+function confirmMessage(env, deviceId, friendlyName, confirmToken, signingSecret) {
+  return {
+    event:         'subscription.confirm',
+    deviceId,
+    device:        friendlyName,
+    title:         'Confirm your EarlyNotify subscription',
+    text:          `Confirm to start receiving update alerts for your ${friendlyName}. ` +
+                   `If you didn't ask for this, ignore it and nothing more will be sent.`,
+    confirmUrl:    `${env.API_SITE_URL}/confirm?token=${confirmToken}`,
+    signingSecret, // generic webhooks only; see genericPayload
+  };
+}
+
+function subscribedMessage(env, deviceId, friendlyName, unsubscribeToken) {
+  return {
+    event:          'subscription.created',
+    deviceId,
+    device:         friendlyName,
+    title:          'Subscribed to EarlyNotify',
+    text:           `You'll get an alert here whenever a new software version is released for your ` +
+                    `${friendlyName}. The current version follows in a few minutes.`,
+    unsubscribeUrl: unsubscribeLink(env, unsubscribeToken),
+  };
+}
+
+function cancelledMessage(deviceId, friendlyName) {
+  return {
+    event:    'subscription.cancelled',
+    deviceId,
+    device:   friendlyName,
+    title:    'You have unsubscribed',
+    text:     `You will no longer receive update notifications for your ${friendlyName}.`,
+  };
+}
+
+// Shared by /confirm and instant-channel signups. No welcome notification is
+// sent from here: last_notified_version is NULL, so flagging the devices has
+// the next dispatch tick (≤2 min) send the current version through the same
+// paced, per-channel path as every other notification.
+async function subscriptionsActivated(env, deviceIds) {
+  await appendPendingDevices(env, deviceIds);
+
+  // First subscriber for a device — drop the cached list so the refresher
+  // starts polling it rather than waiting out the hour TTL.
+  const knownDevices = await env.NOTIFY.get('subscribed_devices', { type: 'json' });
+  if (knownDevices && deviceIds.some(id => !knownDevices.includes(id))) {
+    await env.NOTIFY.delete('subscribed_devices');
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -388,7 +587,7 @@ export default {
       const token = url.searchParams.get('token');
       if (!token) {
         return new Response(unsubscribeErrorPage('No unsubscribe token provided.'), {
-          status: 400, headers: { 'Content-Type': 'text/html' },
+          status: 400, headers: HTML_HEADERS,
         });
       }
 
@@ -399,7 +598,7 @@ export default {
       if (results.length === 0) {
         return new Response(
           unsubscribeErrorPage('This unsubscribe link is invalid or has already been used.'),
-          { status: 404, headers: { 'Content-Type': 'text/html' } }
+          { status: 404, headers: HTML_HEADERS }
         );
       }
 
@@ -409,7 +608,7 @@ export default {
       const friendlyName = parsed.devices.find(d => d.identifier === deviceId)?.name ?? deviceId;
 
       return new Response(unsubscribeConfirmPage(token, friendlyName, env.SITE_URL), {
-        headers: { 'Content-Type': 'text/html' },
+        headers: HTML_HEADERS,
       });
     }
 
@@ -417,47 +616,38 @@ export default {
     // POST /unsubscribe
     // -----------------------------------------------------------------------
     if (request.method === 'POST' && url.pathname === '/unsubscribe') {
-      const formData = await request.formData();
-      const token = formData.get('token');
+      const token = await formField(request, 'token');
       if (!token) {
         return new Response(unsubscribeErrorPage('No unsubscribe token provided.'), {
-          status: 400, headers: { 'Content-Type': 'text/html' },
+          status: 400, headers: HTML_HEADERS,
         });
       }
 
       const { results } = await env.DB.prepare(`
         UPDATE subscriptions SET active = 0, unsubscribe_token = NULL
         WHERE unsubscribe_token = ? AND active = 1
-        RETURNING email, device_id
+        RETURNING destination, channel, device_id, signing_secret
       `).bind(token).all();
 
       if (results.length === 0) {
         return new Response(
           unsubscribeErrorPage('This unsubscribe link is invalid or has already been used.'),
-          { status: 404, headers: { 'Content-Type': 'text/html' } }
+          { status: 404, headers: HTML_HEADERS }
         );
       }
 
-      const { email, device_id: deviceId } = results[0];
+      const row = results[0];
+      const sub = { destination: row.destination, channel: row.channel, signingSecret: row.signing_secret };
+      const friendlyName = (await deviceNames(env))[row.device_id] ?? row.device_id;
 
-      if (email && deviceId) {
-        const deviceData = await env.NOTIFY.get('device_list');
-        const parsed = deviceData ? JSON.parse(deviceData) : { devices: [] };
-        const friendlyName = parsed.devices.find(d => d.identifier === deviceId)?.name ?? deviceId;
-
-        try {
-          await sendEmailLambda(env, email, friendlyName, 'N/A', token, 'unsubscribe');
-        } catch (err) {
-          console.error(`Unsubscribe confirmation email failed for ${email}:`, err);
-        }
-
-        return new Response(unsubscribeSuccessPage(friendlyName, env.SITE_URL), {
-          headers: { 'Content-Type': 'text/html' },
-        });
+      try {
+        await deliver(env, sub, cancelledMessage(row.device_id, friendlyName));
+      } catch (err) {
+        console.error(`Unsubscribe confirmation failed for ${describeDestination(sub)}: ${err?.message ?? err}`);
       }
 
-      return new Response(unsubscribeSuccessPage('your device', env.SITE_URL), {
-        headers: { 'Content-Type': 'text/html' },
+      return new Response(unsubscribeSuccessPage(friendlyName, env.SITE_URL), {
+        headers: HTML_HEADERS,
       });
     }
 
@@ -480,27 +670,32 @@ export default {
     // POST /subscribe
     // -----------------------------------------------------------------------
     if (request.method === 'POST' && url.pathname === '/subscribe') {
-      const formData = await request.formData();
-      const email = formData.get('email')?.toLowerCase().trim();
-      const device = formData.get('device');
-      const hcaptchaToken = formData.get('h-captcha-response');
-
       const headers = {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': 'https://earlynotify.com',
         'Access-Control-Allow-Headers': 'Content-Type',
         'Access-Control-Allow-Methods': 'POST',
       };
+      const fail = (error, status = 400) =>
+        new Response(JSON.stringify({ error }), { status, headers });
 
-      if (!email || !device) {
-        return new Response(JSON.stringify({ error: 'Missing email or device' }), { status: 400, headers });
-      }
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        return new Response(JSON.stringify({ error: 'Invalid email format' }), { status: 400, headers });
-      }
-      if (!hcaptchaToken) {
-        return new Response(JSON.stringify({ error: 'Captcha token missing' }), { status: 400, headers });
-      }
+      let formData;
+      try { formData = await request.formData(); } catch { return fail('Invalid form submission'); }
+      const field = name => { const v = formData.get(name); return typeof v === 'string' ? v : null; };
+
+      // A bare `email` field, with no channel, is what the site sent before
+      // channels existed.
+      const channel = field('channel') ?? 'email';
+      const device = field('device');
+      const hcaptchaToken = field('h-captcha-response');
+
+      if (!CHANNELS.includes(channel)) return fail('Unknown channel');
+      const destination = normalizeDestination(channel, channel === 'pushover'
+        ? `${field('destination') ?? ''}:${field('pushover_token') ?? ''}`
+        : field('destination') ?? field('email'));
+      if (!destination) return fail(DESTINATION_ERROR[channel]);
+      if (!device) return fail('Missing device');
+      if (!hcaptchaToken) return fail('Captcha token missing');
 
       // Run independent I/O in parallel: device list and captcha
       const [deviceListRaw, hcaptchaRes] = await Promise.all([
@@ -514,50 +709,178 @@ export default {
 
       // Captcha first: rejecting on device before verifying the captcha turns
       // /subscribe into a free oracle for which device identifiers are valid.
-      if (!hcaptchaRes.success) {
-        return new Response(JSON.stringify({ error: 'Captcha verification failed' }), { status: 403, headers });
-      }
+      if (!hcaptchaRes.success) return fail('Captcha verification failed', 403);
 
       const deviceList = deviceListRaw ? JSON.parse(deviceListRaw).devices : [];
       const knownDevice = deviceList.find(d => d.identifier === device);
-      if (!knownDevice) {
-        return new Response(JSON.stringify({ error: 'Unknown device' }), { status: 400, headers });
-      }
+      if (!knownDevice) return fail('Unknown device');
 
-      const entry = await readFirmware(env, device, env.KV_CACHE_INVALID * 60 * 1000);
-
-      const latestVersion = entry?.version ?? null;
-      const unsubscribeToken = nanoid();
       const friendlyName = knownDevice.name || device;
+      const now = Date.now();
 
-      await env.DB.prepare(`
-        INSERT INTO subscriptions (email, device_id, subscribed_at, active, unsubscribe_token, last_notified_version)
-        VALUES (?, ?, datetime('now'), 1, ?, ?)
-        ON CONFLICT(email, device_id) DO UPDATE SET
-          active = 1,
-          unsubscribe_token = excluded.unsubscribe_token,
-          last_notified_version = excluded.last_notified_version;
-      `).bind(email, device, unsubscribeToken, latestVersion).run();
+      // Every row this destination has, across all devices: whether it was
+      // suppressed, whether a confirmation went out recently, its signing key.
+      const { results: existing } = await env.DB.prepare(`
+        SELECT device_id, active, confirm_token, confirm_sent_at, signing_secret, deactivated_reason
+        FROM subscriptions WHERE destination = ?
+      `).bind(destination).all();
 
-      if (latestVersion) {
+      // The same answer whatever happens below, so the form can't be used to
+      // learn whether a destination is subscribed, pending or suppressed.
+      const accepted = new Response(JSON.stringify({ message: ACCEPTED_MESSAGE[channel] }), { headers });
+
+      // Bounced, complained or dead destinations are never revived from here —
+      // doing so is what lets anyone re-enrol an address SES told us to stop
+      // mailing. Already-active rows keep their unsubscribe token: rotating it
+      // would break the links in every email the subscriber already has.
+      // Suppressed means a reason and nothing live: a bounce switches off every
+      // row for the address at once. Email only — re-mailing a bounced or
+      // complaining address is what costs SES standing. Other channels are
+      // gated by delivery instead (the welcome post, or the confirmation), so a
+      // dead endpoint can't get back in and a repaired one can.
+      const suppressed = channel === 'email'
+        && existing.some(r => r.deactivated_reason) && !existing.some(r => r.active === 1);
+      if (suppressed) return accepted;
+      if (existing.some(r => r.device_id === device && r.active === 1)) return accepted;
+
+      if (INSTANT_CHANNELS.has(channel)) {
+        // The welcome post doubles as a check that the destination works: if it
+        // fails, nothing is stored and the form says so.
+        const unsubscribeToken = nanoid();
+        const sub = { destination, channel };
         try {
-          await sendEmailLambda(env, email, friendlyName, latestVersion, unsubscribeToken, 'version');
+          await deliver(env, sub, subscribedMessage(env, device, friendlyName, unsubscribeToken));
         } catch (err) {
-          console.error(`Welcome email failed for ${email}:`, err);
-          await env.DB.prepare(
-            'UPDATE subscriptions SET last_notified_version = NULL WHERE email = ? AND device_id = ?'
-          ).bind(email, device).run();
+          console.error(`Welcome failed for ${describeDestination(sub)}: ${err?.message ?? err}`);
+          return fail('Could not deliver to that destination — check it and try again', 502);
         }
+
+        await env.DB.prepare(`
+          INSERT INTO subscriptions
+            (destination, channel, device_id, subscribed_at, active, unsubscribe_token)
+          VALUES (?, ?, ?, datetime('now'), 1, ?)
+          ON CONFLICT(destination, device_id) DO UPDATE SET
+            channel               = excluded.channel,
+            active                = 1,
+            unsubscribe_token     = excluded.unsubscribe_token,
+            confirm_token         = NULL,
+            confirm_sent_at       = NULL,
+            last_notified_version = NULL,
+            deactivated_reason    = NULL,
+            consecutive_failures  = 0
+          WHERE active = 0
+        `).bind(destination, channel, device, unsubscribeToken).run();
+
+        await subscriptionsActivated(env, [device]);
+        return accepted;
       }
 
-      // First subscriber for this device — drop the cached list so the
-      // refresher starts polling it rather than waiting out the hour TTL.
-      const knownDevices = await env.NOTIFY.get('subscribed_devices', { type: 'json' });
-      if (knownDevices && !knownDevices.includes(device)) {
-        await env.NOTIFY.delete('subscribed_devices');
+      const recent = existing.find(r =>
+        r.active === 0 && r.confirm_token && now - r.confirm_sent_at < CONFIRM_RESEND_MS
+      );
+      const confirmToken  = recent?.confirm_token ?? nanoid();
+      const signingSecret = channel === 'webhook'
+        ? (existing.find(r => r.signing_secret)?.signing_secret ?? nanoid(48))
+        : null;
+
+      // Inserted inactive. Only POST /confirm turns a row on, and the WHERE
+      // keeps a racing request from touching a row that is already live.
+      // Suppression was decided above, per destination; a stale reason left on
+      // this one row must not block the write, or the confirmation we are
+      // about to send would carry a token nothing holds.
+      await env.DB.prepare(`
+        INSERT INTO subscriptions
+          (destination, channel, device_id, subscribed_at, active, unsubscribe_token, confirm_token, confirm_sent_at, signing_secret)
+        VALUES (?, ?, ?, datetime('now'), 0, ?, ?, ?, ?)
+        ON CONFLICT(destination, device_id) DO UPDATE SET
+          channel           = excluded.channel,
+          unsubscribe_token = excluded.unsubscribe_token,
+          confirm_token     = excluded.confirm_token,
+          confirm_sent_at   = excluded.confirm_sent_at,
+          signing_secret    = excluded.signing_secret,
+          deactivated_reason = NULL,
+          consecutive_failures = 0
+        WHERE active = 0
+      `).bind(destination, channel, device, nanoid(), confirmToken, recent?.confirm_sent_at ?? now, signingSecret).run();
+
+      // Joining a confirmation already sent: the confirm page lists every
+      // device the token covers, so this one is included without another send.
+      if (recent) return accepted;
+
+      const sub = { destination, channel, signingSecret };
+      try {
+        await deliver(env, sub, confirmMessage(env, device, friendlyName, confirmToken, signingSecret));
+      } catch (err) {
+        console.error(`Confirmation failed for ${describeDestination(sub)}: ${err?.message ?? err}`);
+        // Otherwise the next attempt would join a confirmation that never arrived.
+        await env.DB.prepare('UPDATE subscriptions SET confirm_sent_at = 0 WHERE confirm_token = ?')
+          .bind(confirmToken).run();
+        return fail(channel === 'email'
+          ? 'Could not send the confirmation email, please try again later'
+          : 'Could not deliver the confirmation to that destination', 502);
       }
 
-      return new Response(JSON.stringify({ message: 'Subscription successful!' }), { headers });
+      return accepted;
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /confirm  (confirmation page)
+    //
+    // Never confirms by itself: mail scanners and chat link-unfurlers fetch
+    // every link they see, and a GET that activated would let them opt people
+    // in. The page's button POSTs, as with /unsubscribe.
+    // -----------------------------------------------------------------------
+    if (request.method === 'GET' && url.pathname === '/confirm') {
+      const token = url.searchParams.get('token');
+      const { results } = token
+        ? await env.DB.prepare(
+            'SELECT device_id FROM subscriptions WHERE confirm_token = ? AND active = 0 AND confirm_sent_at > ?'
+          ).bind(token, Date.now() - CONFIRM_TTL_MS).all()
+        : { results: [] };
+
+      if (results.length === 0) {
+        return new Response(
+          unsubscribeErrorPage('This confirmation link is invalid or has expired. Please sign up again.'),
+          { status: 404, headers: HTML_HEADERS }
+        );
+      }
+
+      const names = await deviceNames(env);
+      return new Response(
+        confirmPage(token, results.map(r => names[r.device_id] ?? r.device_id), env.SITE_URL),
+        { headers: HTML_HEADERS }
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // POST /confirm
+    // -----------------------------------------------------------------------
+    if (request.method === 'POST' && url.pathname === '/confirm') {
+      const token = await formField(request, 'token');
+      const { results } = token
+        ? await env.DB.prepare(`
+            UPDATE subscriptions
+            SET active = 1, confirm_token = NULL, confirm_sent_at = NULL, last_notified_version = NULL
+            WHERE confirm_token = ? AND active = 0 AND confirm_sent_at > ?
+            RETURNING device_id
+          `).bind(token, Date.now() - CONFIRM_TTL_MS).all()
+        : { results: [] };
+
+      if (results.length === 0) {
+        return new Response(
+          unsubscribeErrorPage('This confirmation link is invalid or has expired. Please sign up again.'),
+          { status: 404, headers: HTML_HEADERS }
+        );
+      }
+
+      const deviceIds = results.map(r => r.device_id);
+      await subscriptionsActivated(env, deviceIds);
+
+      const names = await deviceNames(env);
+      return new Response(
+        confirmSuccessPage(deviceIds.map(id => names[id] ?? id), env.SITE_URL),
+        { headers: HTML_HEADERS }
+      );
     }
 
     // -----------------------------------------------------------------------
@@ -568,7 +891,9 @@ export default {
     // single invocation can send.
     // -----------------------------------------------------------------------
     if (request.method === 'POST' && url.pathname === '/internal/send') {
-      if (!authorizeInternal(request, env)) return new Response('Forbidden', { status: 403 });
+      if (url.hostname !== INTERNAL_HOST || !authorizeInternal(request, env)) {
+        return new Response('Forbidden', { status: 403 });
+      }
 
       const { batch } = await request.json();
       if (!Array.isArray(batch) || batch.length === 0) {
@@ -580,47 +905,76 @@ export default {
         return new Response('Batch too large', { status: 400 });
       }
 
-      const rawTemplate = await env.NOTIFY.get('email_version');
-      if (!rawTemplate) return new Response('Template email_version not found', { status: 500 });
-      const render = compileTemplate(rawTemplate);
+      // One compiled template per batch, and only if the batch has email in it.
+      // A missing template fails the whole child up front rather than as 36
+      // separate send errors.
+      const templates = {};
+      if (batch.some(n => n.channel === 'email')) {
+        try {
+          await (templates.email_version = loadTemplate(env, 'email_version'));
+        } catch (err) {
+          return new Response(err.message, { status: 500 });
+        }
+      }
 
       let sent = 0;
 
       // Waves of 6 because that is the free tier's simultaneous-connection cap;
       // anything above it queues rather than parallelises. The floor on wave
-      // duration is what holds us at 6 sends/sec/child.
+      // duration is what holds us at 6 sends/sec/child. A webhook or Pushover
+      // post is one subrequest, same as an email, so the budget is unchanged.
       for (let i = 0; i < batch.length; i += SEND_WAVE_SIZE) {
         const wave      = batch.slice(i, i + SEND_WAVE_SIZE);
         const waveStart = Date.now();
 
-        const results = await Promise.allSettled(wave.map(n => sendEmail(
-          env,
-          n.email,
-          `Software Version ${n.version} now available for ${n.friendlyName}`,
-          render({
-            device:         n.friendlyName,
-            version:        n.version,
-            unsubscribeUrl: `${env.API_SITE_URL}/unsubscribe?token=${n.unsubscribeToken}`,
-          })
-        )));
+        const results = await Promise.allSettled(
+          wave.map(n => deliver(env, n, releaseMessage(env, n), templates))
+        );
 
-        const succeeded = [];
+        // Successes and dead-destination suppressions go in one D1 batch, so
+        // the child still spends one subrequest per wave on writes.
+        const writes = [];
         results.forEach((r, j) => {
-          if (r.status === 'fulfilled') succeeded.push(wave[j]);
-          else console.error(`Failed to send to ${wave[j].email}:`, r.reason);
+          const n = wave[j];
+          if (r.status === 'fulfilled') {
+            writes.push(env.DB.prepare(`
+              UPDATE subscriptions SET last_notified_version = ?, consecutive_failures = 0
+              WHERE destination = ? AND device_id = ?
+            `).bind(n.version, n.destination, n.deviceId));
+            sent++;
+            return;
+          }
+          console.error(`Failed to send to ${describeDestination(n)}: ${r.reason?.message ?? r.reason}`);
+          // The webhook's equivalent of a hard bounce: deleted, or the
+          // receiver said to stop. Retrying it every sweep forever helps nobody.
+          if (r.reason?.permanent) {
+            writes.push(env.DB.prepare(`
+              UPDATE subscriptions SET active = 0, unsubscribe_token = NULL, deactivated_reason = 'gone'
+              WHERE destination = ? AND active = 1
+            `).bind(n.destination));
+          } else if (n.channel !== 'email') {
+            // D1 runs a batch in order, so the second statement sees the first's
+            // increment. It switches off every row for the destination, as the
+            // endpoint is what's dead, not the one device.
+            writes.push(
+              env.DB.prepare(`
+                UPDATE subscriptions SET consecutive_failures = consecutive_failures + 1
+                WHERE destination = ? AND device_id = ?
+              `).bind(n.destination, n.deviceId),
+              env.DB.prepare(`
+                UPDATE subscriptions SET active = 0, unsubscribe_token = NULL, deactivated_reason = 'unresponsive'
+                WHERE destination = ?1 AND active = 1 AND EXISTS (
+                  SELECT 1 FROM subscriptions WHERE destination = ?1 AND consecutive_failures >= ?2
+                )
+              `).bind(n.destination, MAX_CONSECUTIVE_FAILURES),
+            );
+          }
         });
 
         // Committed per wave, not once at the end: these messages have already
-        // left SES, so if the child dies before recording them the sweep resends
-        // every uncommitted one. Per-wave bounds that blast radius to 6.
-        if (succeeded.length > 0) {
-          await env.DB.batch(succeeded.map(n =>
-            env.DB.prepare(
-              'UPDATE subscriptions SET last_notified_version = ? WHERE email = ? AND device_id = ?'
-            ).bind(n.version, n.email, n.deviceId)
-          ));
-          sent += succeeded.length;
-        }
+        // been delivered, so if the child dies before recording them the sweep
+        // resends every uncommitted one. Per-wave bounds that blast radius to 6.
+        if (writes.length > 0) await env.DB.batch(writes);
 
         // Every wave is floored, including the last. Skipping the final sleep
         // looks like a harmless optimisation but it is not: the parent starts
@@ -651,11 +1005,15 @@ export default {
       if (!authorizeInternal(request, env)) return new Response('Forbidden', { status: 403 });
 
       const { email, reason } = await request.json();
-      if (!email) return new Response('Missing email', { status: 400 });
+      if (typeof email !== 'string' || !email) return new Response('Missing email', { status: 400 });
 
+      // Pending and already-unsubscribed rows are marked too, not just live
+      // ones: deactivated_reason is what stops /subscribe re-enrolling the
+      // address, and a confirmation email is as able to bounce as any other.
       const { meta } = await env.DB.prepare(`
-        UPDATE subscriptions SET active = 0, unsubscribe_token = NULL, deactivated_reason = ?
-        WHERE email = ? AND active = 1
+        UPDATE subscriptions
+        SET active = 0, unsubscribe_token = NULL, confirm_token = NULL, deactivated_reason = ?
+        WHERE destination = ? AND channel = 'email' AND (deactivated_reason IS NULL OR active = 1)
       `).bind(String(reason ?? 'bounce').slice(0, 100), email.toLowerCase().trim()).run();
 
       console.log(`Suppressed ${meta?.changes ?? 0} subscription(s) for ${email}: ${reason}`);
@@ -853,7 +1211,7 @@ async function runDispatch(env, devices, flagged, startedAt) {
     binds.push(rowCap - rows.length);
 
     const { results } = await env.DB.prepare(`
-      SELECT email, device_id, unsubscribe_token
+      SELECT destination, channel, device_id, unsubscribe_token, signing_secret
       FROM subscriptions
       WHERE active = 1 AND (${clauses.join(' OR ')})
       LIMIT ?
@@ -872,19 +1230,29 @@ async function runDispatch(env, devices, flagged, startedAt) {
 
   const versionFor = Object.fromEntries(targets.map(t => [t.deviceId, t.version]));
   const pending = rows.map(row => ({
-    email:            row.email,
+    destination:      row.destination,
+    channel:          row.channel,
+    signingSecret:    row.signing_secret,
     deviceId:         row.device_id,
     friendlyName:     nameMap[row.device_id] ?? row.device_id,
     version:          versionFor[row.device_id],
     unsubscribeToken: row.unsubscribe_token,
   }));
 
+  // Generic webhooks go last. They are the one destination a subscriber can
+  // make slow on purpose — an endpoint that never answers turns its 1 s wave
+  // into a DELIVERY_TIMEOUT_MS one — so they must not share waves with, or
+  // queue ahead of, anyone else. Whatever the deadline cuts off is still
+  // flagged and goes out next tick.
+  const DISPATCH_ORDER = { email: 0, webhook: 2 };
+  pending.sort((a, b) => (DISPATCH_ORDER[a.channel] ?? 1) - (DISPATCH_ORDER[b.channel] ?? 1));
+
   const chunks = [];
   for (let i = 0; i < pending.length; i += EMAILS_PER_CHILD) {
     chunks.push(pending.slice(i, i + EMAILS_PER_CHILD));
   }
 
-  console.log(`Dispatching ${pending.length} emails across ${chunks.length} batches`);
+  console.log(`Dispatching ${pending.length} notifications across ${chunks.length} batches`);
 
   let sent = 0;
   let next = 0;
@@ -895,7 +1263,7 @@ async function runDispatch(env, devices, flagged, startedAt) {
         // Through the SELF service binding, never the public URL: a global
         // fetch() to a Worker on its own zone fails, so every batch errored
         // out and the run sent 0 emails.
-        const res = await env.SELF.fetch('https://internal/internal/send', {
+        const res = await env.SELF.fetch(`https://${INTERNAL_HOST}/internal/send`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-internal-key': env.INTERNAL_SECRET },
           body: JSON.stringify({ batch: chunk }),
@@ -922,35 +1290,184 @@ async function runDispatch(env, devices, flagged, startedAt) {
 }
 
 // -----------------------------------------------------------------------------
-// Email
+// Delivery
+//
+// deliver() sends one channel-neutral message (see releaseMessage and friends)
+// to one subscription, rendered for its channel. It throws DeliveryError, with
+// `permanent` set when the destination is gone for good.
 // -----------------------------------------------------------------------------
-async function sendEmailLambda(env, to, device, version, unsubscribeToken, messageType, templates = {}) {
-  const unsubscribeUrl = `${env.API_SITE_URL}/unsubscribe?token=${unsubscribeToken}`;
+class DeliveryError extends Error {
+  constructor(message, permanent = false) {
+    super(message);
+    this.permanent = permanent;
+  }
+}
 
-  let subject, templateKey;
-  switch (messageType) {
-    case 'version':
-      subject     = `Software Version ${version} now available for ${device}`;
-      templateKey = 'email_version';
-      break;
-    case 'unsubscribe':
-      subject     = 'You have unsubscribed';
-      templateKey = 'email_unsubscribe';
-      break;
-    default:
-      subject     = 'iOS Update Notification';
-      templateKey = 'email_version';
+const EMAIL_TEMPLATE = {
+  'firmware.released':      'email_version',
+  'subscription.confirm':   'email_confirm',
+  'subscription.cancelled': 'email_unsubscribe',
+};
+
+const PUSHOVER_URL = 'https://api.pushover.net/1/messages.json';
+
+// `templates` caches compiled templates across a batch. It holds the promise,
+// not the result, so a wave of six parallel sends shares one KV read.
+async function deliver(env, sub, msg, templates = {}) {
+  if (sub.channel === 'email') {
+    const key = EMAIL_TEMPLATE[msg.event];
+    const render = await (templates[key] ??= loadTemplate(env, key));
+    return sendEmail(env, sub.destination, msg.title, render(msg));
   }
 
-  const rawTemplate = templates[templateKey] ?? await env.NOTIFY.get(templateKey);
-  if (!rawTemplate) throw new Error(`Template ${templateKey} not found`);
+  let target = sub.destination;
+  let body;
+  let contentType = 'application/json';
+  const headers = { 'User-Agent': IPSW_USER_AGENT };
 
-  const emailBody = rawTemplate
-    .replaceAll('${device}', device)
-    .replaceAll('${version}', version)
-    .replaceAll('${unsubscribeUrl}', unsubscribeUrl);
+  switch (sub.channel) {
+    case 'discord': body = JSON.stringify(discordPayload(msg)); break;
+    case 'slack':   body = JSON.stringify(slackPayload(msg));   break;
+    case 'teams':   body = JSON.stringify(teamsPayload(msg));   break;
+    case 'pushover':
+      target      = PUSHOVER_URL;
+      body        = new URLSearchParams(pushoverPayload(sub, msg)).toString();
+      contentType = 'application/x-www-form-urlencoded';
+      break;
+    case 'webhook':
+      body = JSON.stringify(genericPayload(msg));
+      Object.assign(headers, await signatureHeaders(sub.signingSecret, msg.event, body));
+      break;
+    default:
+      throw new DeliveryError(`Unknown channel ${sub.channel}`);
+  }
 
-  await sendEmail(env, to, subject, emailBody);
+  const res = await fetch(target, {
+    method:   'POST',
+    headers:  { ...headers, 'Content-Type': contentType },
+    body,
+    redirect: 'manual',
+    signal:   AbortSignal.timeout(DELIVERY_TIMEOUT_MS),
+  });
+  if (res.ok) return discard(res);
+
+  // Chat services answer 404 for a deleted webhook. A generic receiver only
+  // counts as gone on an explicit 410, so a server having a bad day isn't
+  // unsubscribed for it. Pushover's endpoint is fixed, so it reports a bad
+  // user key or app token in the body instead.
+  let permanent = false;
+  if (sub.channel === 'pushover') {
+    const data = res.status === 400 ? await res.json().catch(() => ({})) : (await discard(res), {});
+    permanent = data.user === 'invalid' || data.token === 'invalid';
+  } else {
+    permanent = res.status === 410 || (res.status === 404 && sub.channel !== 'webhook');
+    await discard(res);
+  }
+  throw new DeliveryError(`${describeDestination(sub)} returned ${res.status}`, permanent);
+}
+
+// Unread bodies hold a connection open, and the free tier only has six.
+function discard(res) {
+  return res.body?.cancel().catch(() => {});
+}
+
+// The action link (if any) first, then unsubscribe.
+function messageLinks(msg) {
+  const out = [];
+  if (msg.confirmUrl)     out.push({ label: 'Confirm subscription', url: msg.confirmUrl });
+  if (msg.unsubscribeUrl) out.push({ label: 'Unsubscribe', url: msg.unsubscribeUrl });
+  return out;
+}
+
+function discordPayload(msg) {
+  return {
+    username: 'EarlyNotify',
+    embeds: [{
+      title:       msg.title,
+      description: [msg.text, ...messageLinks(msg).map(l => `[${l.label}](${l.url})`)].join('\n\n'),
+      color:       0x06b6d4,
+    }],
+    allowed_mentions: { parse: [] },
+  };
+}
+
+function slackPayload(msg) {
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return {
+    text: [
+      `*${esc(msg.title)}*`,
+      esc(msg.text),
+      ...messageLinks(msg).map(l => `<${l.url}|${esc(l.label)}>`),
+    ].join('\n'),
+    unfurl_links: false,
+  };
+}
+
+function teamsPayload(msg) {
+  return {
+    type: 'message',
+    attachments: [{
+      contentType: 'application/vnd.microsoft.card.adaptive',
+      content: {
+        $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+        type:    'AdaptiveCard',
+        version: '1.4',
+        body: [
+          { type: 'TextBlock', text: msg.title, weight: 'Bolder', size: 'Medium', wrap: true },
+          { type: 'TextBlock', text: msg.text, wrap: true },
+        ],
+        actions: messageLinks(msg).map(l => ({ type: 'Action.OpenUrl', title: l.label, url: l.url })),
+      },
+    }],
+  };
+}
+
+// The subscriber's own Pushover application sends, so its monthly quota is
+// theirs, not ours.
+function pushoverPayload(sub, msg) {
+  const [user, token] = sub.destination.split(':');
+  const [primary, ...rest] = messageLinks(msg);
+  const payload = {
+    token,
+    user,
+    title:   msg.title.slice(0, 250),
+    message: [msg.text, ...rest.map(l => `${l.label}: ${l.url}`)].join('\n\n').slice(0, 1024),
+  };
+  if (primary) Object.assign(payload, { url: primary.url, url_title: primary.label });
+  return payload;
+}
+
+// The signing secret travels only in subscription.confirm, i.e. only to the
+// endpoint itself. Returning it from /subscribe would hand it to whoever filled
+// in the form — who need not own the endpoint — letting them forge our
+// signatures to it.
+function genericPayload(msg) {
+  return {
+    event:           msg.event,
+    device:          { id: msg.deviceId, name: msg.device },
+    version:         msg.version ?? null,
+    confirm_url:     msg.confirmUrl,
+    signing_secret:  msg.signingSecret ?? undefined,
+    unsubscribe_url: msg.unsubscribeUrl,
+    sent_at:         new Date().toISOString(),
+  };
+}
+
+// Signature is HMAC-SHA256 over `${timestamp}.${body}`, hex, so receivers can
+// both verify the sender and reject replays outside a time window.
+async function signatureHeaders(secret, event, body) {
+  const enc       = new TextEncoder();
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const key = await crypto.subtle.importKey(
+    'raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const mac = await crypto.subtle.sign('HMAC', key, enc.encode(`${timestamp}.${body}`));
+  const hex = [...new Uint8Array(mac)].map(b => b.toString(16).padStart(2, '0')).join('');
+  return {
+    'X-EarlyNotify-Event':     event,
+    'X-EarlyNotify-Timestamp': timestamp,
+    'X-EarlyNotify-Signature': `sha256=${hex}`,
+  };
 }
 
 async function sendEmail(env, to, subject, body) {
@@ -964,8 +1481,29 @@ async function sendEmail(env, to, subject, body) {
 }
 
 // -----------------------------------------------------------------------------
-// HTML helpers (unchanged)
+// HTML helpers
 // -----------------------------------------------------------------------------
+
+// These pages carry tokens in their URL and forms: no-referrer keeps the token
+// out of the Referer sent to earlynotify.com, and frame-ancestors stops the
+// buttons being clickjacked.
+const HTML_HEADERS = {
+  'Content-Type':            'text/html; charset=utf-8',
+  'Content-Security-Policy': "frame-ancestors 'none'",
+  'Referrer-Policy':         'no-referrer',
+  'X-Content-Type-Options':  'nosniff',
+};
+
+// A single string field from a form body, or null — also when the body isn't
+// a form at all, rather than letting formData() throw a 500.
+async function formField(request, name) {
+  try {
+    const value = (await request.formData()).get(name);
+    return typeof value === 'string' && value ? value : null;
+  } catch {
+    return null;
+  }
+}
 function escapeHtml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -1088,6 +1626,34 @@ function unsubscribeSuccessPage(deviceName, siteUrl) {
     <a href="${siteUrl || 'https://earlynotify.com'}" class="btn btn-primary">Back to EarlyNotify</a>
   `;
   return unsubscribeShell('Unsubscribed', body, siteUrl);
+}
+
+function deviceListHtml(names) {
+  return names.map(n => `<span class="device">${escapeHtml(n)}</span>`).join(', ');
+}
+
+function confirmPage(token, deviceNames, siteUrl) {
+  const body = `
+    <div class="icon" style="background: rgba(6,182,212,0.1);">🔔</div>
+    <h1>Confirm your subscription</h1>
+    <p>You'll get an alert when a new software version is released for your ${deviceListHtml(deviceNames)}.</p>
+    <p>If you didn't sign up for this, just close this page — nothing will be sent.</p>
+    <form method="POST" action="/confirm">
+      <input type="hidden" name="token" value="${escapeHtml(token)}">
+      <button type="submit" class="btn btn-primary">Confirm subscription</button>
+    </form>
+  `;
+  return unsubscribeShell('Confirm Subscription', body, siteUrl);
+}
+
+function confirmSuccessPage(deviceNames, siteUrl) {
+  const body = `
+    <div class="icon" style="background: rgba(74,222,128,0.1);">✓</div>
+    <h1>You're subscribed</h1>
+    <p>You'll be notified of new releases for your ${deviceListHtml(deviceNames)}, starting with the current version in the next few minutes.</p>
+    <a href="${siteUrl || 'https://earlynotify.com'}" class="btn btn-primary">Back to EarlyNotify</a>
+  `;
+  return unsubscribeShell('Subscribed', body, siteUrl);
 }
 
 function unsubscribeErrorPage(message) {

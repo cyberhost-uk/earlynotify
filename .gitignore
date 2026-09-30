@@ -19,3 +19,6 @@ wrangler.toml
 .env
 .env.*
 .dev.vars
+
+# Metrics Worker and Grafana dashboard, kept out of the repo
+/metrics
